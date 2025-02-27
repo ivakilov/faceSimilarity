@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en" >
+<head>
+  <meta charset="UTF-8">
+  <title>MediaPipe Face Detector for web</title>
+  <link rel="stylesheet" href="./style.css">
+
+</head>
+<body>
+
+<link href="https://unpkg.com/material-components-web@latest/dist/material-components-web.min.css" rel="stylesheet">
+
+<!-- <h1>Face detection using the MediaPipe Face Detector task</h1> -->
+
+<section id="demos" class="invisible">
+
+  <div class="detectOnClick">
+    <img id="inputImage" src="face.png" width="100%" />
+    <canvas class="image_canvas" id="image_canvas" width="100%"></canvas>
+    <p id="embedImage"></p>
+  </div>
+  </div>
+
+  <h2>Demo: Webcam continuous face detection</h2>
+  <p>Detect faces from your webcam. When ready click "enable webcam" below and accept access to the webcam.</p>
+  <div id="liveView" class="videoView">
+    <button id="webcamButton" class="mdc-button mdc-button--raised">
+      <span class="mdc-button__ripple"></span>
+      <span class="mdc-button__label">ENABLE WEBCAM</span>
+    </button>
+    <video id="webcam" autoplay playsinline></video>
+    <canvas class="video_canvas" id="video_canvas" width="100%"></canvas>
+  </div>
+  <!-- <div class="detectOnClick">
+    <p id="embedVideoImage"></p>
+  </div> -->
+  <div class="detectOnClick">
+    <p id="similarity"></p>
+  </div>
+</section>
+<!-- partial -->
+  <script type="module" src="./script.js"></script>
+
+</body>
+</html>
