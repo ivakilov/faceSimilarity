@@ -23,7 +23,9 @@ const initializefaceDetectorAndEmbedder = async () => {
             modelAssetPath: `https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/1/blaze_face_short_range.tflite`,
             delegate: "GPU"
         },
-        runningMode: runningMode
+        runningMode: runningMode,
+        minDetectionConfidence: 0.5,
+        numFaces: 1 // Максимальное количество обнаруживаемых лиц
     });
 
     // Embedder
@@ -217,11 +219,14 @@ async function predictWebcam() {
         const detections = faceDetector.detectForVideo(video, startTimeMs)
             .detections;
         displayVideoDetections(detections);
-        const canvasCrop = getVideoImage(video)
-        videoFaceCropped = cropFace(detections, canvasCrop)
-        drawImageOnCanvas(videoFaceCropped, videoCanvas)
-        videoImageEmbedderResult = await imageEmbedder.embed(videoFaceCropped);
-        // showEmbedding(videoImageEmbedderResult, embeddingVideoImage)
+
+        if(detections.length){ // check detections is not empty
+            const canvasCrop = getVideoImage(video)
+            videoFaceCropped = cropFace(detections, canvasCrop)
+            drawImageOnCanvas(videoFaceCropped, videoCanvas)
+            videoImageEmbedderResult = await imageEmbedder.embed(videoFaceCropped);
+            // showEmbedding(videoImageEmbedderResult, embeddingVideoImage)
+        }
     }
     if(!imageEmbedderResult && imageFaceCropped != null){
         imageEmbedderResult = await imageEmbedder.embed(imageFaceCropped);
