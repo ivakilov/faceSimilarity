@@ -32,6 +32,10 @@ video {
   -webkit-transform: rotateY(180deg);
   -moz-transform: rotateY(180deg);
 }
+.image_canvas {
+  clear: both;
+  display: block;
+}
 
 section {
   opacity: 1;
@@ -91,14 +95,4 @@ section {
 
 .detectOnClick img {
   width: 100%;
-}
-.key-point {
-  position: absolute;
-  z-index: 1;
-  width: 3px;
-  height: 3px;
-  background-color: #ff0000;
-  /* border: 1px solid #ffffff; */
-  border-radius: 50%;
-  display: block;
 }
