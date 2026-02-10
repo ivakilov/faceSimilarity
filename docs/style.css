@@ -96,3 +96,7 @@ section {
 .detectOnClick img {
   width: 100%;
 }
+#liveView video,
+#liveView canvas {
+  transform: scaleX(-1); /* Зеркалим визуально и видео, и канвас */
+}

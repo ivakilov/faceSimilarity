@@ -1,363 +1,391 @@
-import { FaceDetector, ImageEmbedder, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3";
+// Импорт
+import * as faceapi from 'https://cdn.jsdelivr.net/npm/@vladmandic/face-api/dist/face-api.esm.js';
+
+// --- ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ---
+const MODEL_URL = 'https://cdn.jsdelivr.net/npm/@vladmandic/face-api/model/';
+
+// Элементы DOM
 const demosSection = document.getElementById("demos");
 const imageCanvas = document.getElementsByClassName("image_canvas")[0];
 const videoCanvas = document.getElementsByClassName("video_canvas")[0];
-let imageFaceCropped; // Вырезанная область лица на фотографии
-let videoFaceCropped; // Вырезанная область лица на видео
-let imageEmbedderResult; // Эмбеддинг для изображения
-let videoImageEmbedderResult; // Эмбеддинг для изображения
 const embeddingImage = document.getElementById("embedImage");
-// const embeddingImage2 = document.getElementById("embedImage2");
-const similarity = document.getElementById("similarity");
-let faceDetector;
-let imageEmbedder;
-let runningMode = "IMAGE";
-// Initialize the object detector
-const initializefaceDetectorAndEmbedder = async () => {
-    const vision = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0/wasm");
-    
-    // faceDetector
-    faceDetector = await FaceDetector.createFromOptions(vision, {
-        baseOptions: {
-            modelAssetPath: `https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/1/blaze_face_short_range.tflite`,
-            delegate: "GPU"
-        },
-        runningMode: runningMode,
-        minDetectionConfidence: 0.5,
-        numFaces: 1 // Максимальное количество обнаруживаемых лиц
-    });
+const similarityElement = document.getElementById("similarity");
+const headAngleElement = document.getElementById("headAngle");
+const headRotationElement = document.getElementById("headRotation");
+const video = document.getElementById("webcam");
+const liveView = document.getElementById("liveView");
+let enableWebcamButton = document.getElementById("webcamButton");
 
-    // Embedder
-    imageEmbedder = await ImageEmbedder.createFromOptions(vision, {
-        baseOptions: {
-            modelAssetPath: `https://storage.googleapis.com/mediapipe-models/image_embedder/mobilenet_v3_small/float32/1/mobilenet_v3_small.tflite`
-        },
-        runningMode: runningMode
-    });
-    demosSection.classList.remove("invisible");
+// Переменные для хранения данных
+let targetDescriptor = null; // Эмбеддинг целевого фото
+let videoDescriptor = null;  // Эмбеддинг лица с видео
+let isModelLoaded = false;
+let isVideoPlaying = false;
+
+// Опции детектора (SSD Mobilenet V1 - баланс скорости и точности)
+// minConfidence: 0.5 отсекает "шум"
+const getDetectorOptions = () => new faceapi.SsdMobilenetv1Options({ minConfidence: 0.5 });
+
+
+// --- ИНИЦИАЛИЗАЦИЯ ---
+const initializeFaceModels = async () => {
+    console.log("⏳ Загрузка моделей нейросети...");
+    try {
+        // Загружаем необходимые модели
+        await Promise.all([
+            faceapi.nets.ssdMobilenetv1.loadFromUri(MODEL_URL),    // Детектор
+            faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL), // 68 точек лица (для углов)
+            faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL) // Распознавание (FaceNet)
+        ]);
+
+        console.log("✅ Модели загружены!");
+        isModelLoaded = true;
+        
+        if (demosSection) demosSection.classList.remove("invisible");
+
+    } catch (error) {
+        console.error("❌ Ошибка при загрузке моделей:", error);
+    }
 };
-initializefaceDetectorAndEmbedder();
-/********************************************************************
- // Demo 1: Grab a bunch of images from the page and detection them
- // upon click.
- ********************************************************************/
+
+initializeFaceModels();
+
+
+// --- ОБРАБОТКА КЛИКА ПО КАРТИНКЕ (TARGET IMAGE) ---
 const imageContainers = document.getElementsByClassName("detectOnClick");
 
 for (let imageContainer of imageContainers) {
     imageContainer.children[0].addEventListener("click", handleClick);
 }
-/**
- * Detect faces in still images on click
- */
+
+// --- CLICK HANDLER (ФОТО) ---
 async function handleClick(event) {
-    const highlighters = event.target.parentNode.getElementsByClassName("highlighter");
-    while (highlighters[0]) {
-        highlighters[0].parentNode.removeChild(highlighters[0]);
+    if (!isModelLoaded) return;
+
+    const imgElement = event.target;
+    const parent = imgElement.parentNode;
+
+    // 1. Детекция
+    const detections = await faceapi
+        .detectAllFaces(imgElement, getDetectorOptions())
+        .withFaceLandmarks()
+        .withFaceDescriptors();
+
+    if (!detections.length) return;
+
+    const face = detections[0];
+    targetDescriptor = face.descriptor;
+
+    // 2. Считаем угол
+    const angles = calculateHeadRotationAngle(face.landmarks);
+    showHeadRotation(headRotationElement, angles.yaw.toFixed(1));     
+    showHeadAngle(headAngleElement, angles.roll.toFixed(1)); 
+
+    // 3. Рисуем ПОВЕРНУТУЮ рамку
+    // Передаем угол Roll
+    displayRotatedDetections([face], parent, angles.roll);
+
+    // 4. Делаем "Умный кроп" (вырезаем выпрямленное лицо)
+    // Передаем исходную картинку, данные детекции и угол, на который надо "откатить" наклон
+    const croppedCanvas = cropRotatedFace(imgElement, face, -angles.roll); // Минус, чтобы компенсировать наклон
+    
+    // Рисуем полученный кроп в маленький канвас
+    drawImageOnCanvas(croppedCanvas, imageCanvas);
+
+    // Показываем эмбеддинг
+    showEmbedding(targetDescriptor, embeddingImage);
+    
+    if (videoDescriptor) calculateAndShowSimilarity();
+}
+
+// --- WEBCAM LOOP (ВИДЕО) ---
+async function predictWebcam() {
+    if (!isVideoPlaying) return;
+
+    // 1. Детекция
+    const detections = await faceapi
+        .detectAllFaces(video, getDetectorOptions())
+        .withFaceLandmarks()
+        .withFaceDescriptors();
+
+    if (detections.length > 0) {
+        // Ресайзим результаты под размер видео на экране, чтобы рамка не улетала
+        const displaySize = { width: video.offsetWidth, height: video.offsetHeight };
+        const resizedDetections = faceapi.resizeResults(detections, displaySize);
+        
+        const face = resizedDetections[0];
+        
+        // Обратите внимание: дескриптор берем из ОРИГИНАЛЬНОЙ (не ресайзнутой) детекции для точности,
+        // но для простоты здесь возьмем из первой (face-api обычно справляется).
+        // Лучше брать дескриптор от `detections[0]`, а координаты для рамки от `resizedDetections[0]`.
+        videoDescriptor = detections[0].descriptor; 
+
+        // 2. Углы
+        const angles = calculateHeadRotationAngle(face.landmarks);
+        showHeadRotation(headRotationElement, angles.yaw.toFixed(1));     
+        showHeadAngle(headAngleElement, angles.roll.toFixed(1)); 
+
+        // 3. Рисуем ПОВЕРНУТУЮ рамку на видео
+        displayRotatedDetections([face], liveView, angles.roll);
+
+        // 4. Кропаем лицо с видео (Выпрямляем его)
+        // Важно: кропаем с самого видео-элемента
+        // Используем 'detections[0]' (реальные координаты видео), а не 'face' (экранные координаты),
+        // так как cropRotatedFace работает с sourceImage (video) напрямую.
+        const croppedCanvas = cropRotatedFace(video, detections[0], -angles.roll);
+        
+        drawImageOnCanvas(croppedCanvas, videoCanvas);
+
+        if (targetDescriptor) calculateAndShowSimilarity();
+    } else {
+        // Если лиц нет, убираем рамки
+        const old = liveView.querySelectorAll('.highlighter');
+        old.forEach(el => el.remove());
     }
-    const infos = event.target.parentNode.getElementsByClassName("info");
-    while (infos[0]) {
-        infos[0].parentNode.removeChild(infos[0]);
-    }
-    const keyPoints = event.target.parentNode.getElementsByClassName("key-point");
-    while (keyPoints[0]) {
-        keyPoints[0].parentNode.removeChild(keyPoints[0]);
-    }
-    if (!faceDetector) {
-        console.log("Wait for objectDetector to load before clicking");
+
+    window.requestAnimationFrame(predictWebcam);
+}
+
+const hasGetUserMedia = () => !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
+
+if (hasGetUserMedia()) {
+    enableWebcamButton.addEventListener("click", enableCam);
+} else {
+    console.warn("getUserMedia() не поддерживается вашим браузером");
+}
+
+async function enableCam(event) {
+    if (!isModelLoaded) {
+        alert("Подождите, модели еще грузятся...");
         return;
     }
-    // if video mode is initialized, set runningMode to image
-    if (runningMode === "VIDEO") {
-        runningMode = "IMAGE";
-        await faceDetector.setOptions({ runningMode: "IMAGE" });
-    }
-    // faceDetector.detect returns a promise which, when resolved, is an array of Detection faces
-    const detections = faceDetector.detect(event.target).detections;
 
-    if(detections.length){ // check detections is not empty  
-        const HeadRotationAngle = calculateHeadRotationAngle(detections);    
-        displayImageDetections(detections, event.target, -HeadRotationAngle);// * (-1); // домножение на -1 при неотзеркаленном изображении 
-        imageFaceCropped = cropFace(detections, event.target, HeadRotationAngle);
-        drawImageOnCanvas(imageFaceCropped, imageCanvas);
-        const croppedImageEmbedderResult = await imageEmbedder.embed(imageFaceCropped);
-        showEmbedding(croppedImageEmbedderResult, embeddingImage)
+    enableWebcamButton.classList.add("removed");
+
+    const constraints = { video: true };
+
+    try {
+        const stream = await navigator.mediaDevices.getUserMedia(constraints);
+        video.srcObject = stream;
+        video.addEventListener("loadeddata", predictWebcam);
+        isVideoPlaying = true;
+    } catch (err) {
+        console.error("Ошибка доступа к камере:", err);
     }
 }
 
+function calculateAndShowSimilarity() {
+    if (!targetDescriptor || !videoDescriptor) return;
 
-function cropFace(detections, image, angle) {
-    if (detections.length === 0) return null;
-
-    const detection = detections[0];
-    const bbox = detection.boundingBox;
+    // Евклидово расстояние
+    const distance = faceapi.euclideanDistance(targetDescriptor, videoDescriptor);
     
-    // Получаем исходные параметры bounding box
-    const width = bbox.width;
-    const height = bbox.height;
+    // Перевод в % схожести (примерная формула)
+    // 0 distance = 100% similarity
+    // > 0.6 distance = 0% similarity (другой человек)
+    const similarityVal = Math.max(0, 1 - distance);
     
-    // Корректируем размеры с учетом поворота
-    const [adjustedWidth, adjustedHeight] = adjustBoundingBox(width, height, angle);
+    similarityElement.innerText = `Similarity: ${similarityVal.toFixed(2)}`;
+}
 
-    // Центр лица до поворота
-    const centerX = bbox.originX + width/2;
-    const centerY = bbox.originY + height/2;
+// Расчет поворота головы на основе 68 точек face-api
 
-    // Создаем временный canvas для поворота
+function calculateHeadRotationAngle(landmarks) {
+    const points = landmarks.positions; 
+    const leftEye = points[36];  // Внешний уголок левого глаза
+    const rightEye = points[45]; // Внешний уголок правого глаза
+    const nose = points[30];     // Кончик носа
+
+    // --- 1. ROLL (Наклон) ---
+    const deltaY = rightEye.y - leftEye.y;
+    const deltaX = rightEye.x - leftEye.x;
+    const angleRad = Math.atan2(deltaY, deltaX);
+    const rollAngle = angleRad * (180 / Math.PI);
+
+    // --- 2. YAW (Поворот) ---
+    const eyeDist = Math.sqrt(deltaX * deltaX + deltaY * deltaY);
+    const eyesCenter = { x: (leftEye.x + rightEye.x) / 2, y: (leftEye.y + rightEye.y) / 2 };
+    const noseOffset = nose.x - eyesCenter.x;
+    const yawAngle = (noseOffset / eyeDist) * 100; // Эмпирический коэффициент
+
+    return {
+        roll: rollAngle,
+        yaw: yawAngle,
+        eyesCenter: eyesCenter // Возвращаем центр глаз для точного кропа
+    };
+}
+
+
+// Функция кропа с поворотом
+function cropRotatedFace(sourceImage, result, angle) {
+    const box = result.detection ? result.detection.box : result;
+    
+    // Если вдруг box не найден, то выходим
+    if (!box || !box.width) { 
+        console.error("Не удалось найти координаты лица для кропа", result); 
+        return document.createElement("canvas"); 
+    }
+
+    // Центр лица (вокруг которого будем вращать)
+    const centerX = box.x + box.width / 2;
+    const centerY = box.y + box.height / 2;
+
+    // Немного расширяем область (1.5 - чтобы захватить всю голову при повороте)
+    const width = box.width * 1.5; 
+    const height = box.height * 1.5;
+
+    // Создаем временный канвас
     const offscreenCanvas = document.createElement("canvas");
     const ctx = offscreenCanvas.getContext("2d");
 
-    // Увеличиваем размер canvas для аккомодации поворота
-    offscreenCanvas.width = Math.max(image.width, centerX * 2);
-    offscreenCanvas.height = Math.max(image.height, centerY * 2);
+    // Размер канваса должен быть достаточным, чтобы вместить повернутое изображение
+    // Берем диагональ (hypot) для гарантии
+    const diag = Math.hypot(width, height);
+    offscreenCanvas.width = diag;
+    offscreenCanvas.height = diag;
 
-    // Переносим начало координат в центр лица
-    ctx.translate(centerX, centerY);
-    ctx.rotate(angle * Math.PI / 180);
-    ctx.translate(-centerX, -centerY);
-
-    // Рисуем исходное изображение
-    ctx.drawImage(image, 0, 0);
-
-    // Рассчитываем новые границы с учетом поворота
-    const rotationMatrix = [
-        Math.cos(angle * Math.PI / 180), 
-        Math.sin(angle * Math.PI / 180),
-        -Math.sin(angle * Math.PI / 180), 
-        Math.cos(angle * Math.PI / 180)
-    ];
-
-    // Корректируем координаты вырезаемой области
-    const dx = adjustedWidth/2 - width/2;
-    const dy = adjustedHeight/2 - height/2;
+    // Переносим начало координат в центр канваса
+    ctx.translate(diag / 2, diag / 2);
     
-    const rotatedMinX = centerX - adjustedWidth/2 + rotationMatrix[0] * dx + rotationMatrix[1] * dy;
-    const rotatedMinY = centerY - adjustedHeight/2 + rotationMatrix[2] * dx + rotationMatrix[3] * dy;
+    // Поворачиваем пространство (angle в градусах -> радианы)
+    ctx.rotate((angle * Math.PI) / 180);
 
-    // Создаем итоговый canvas
-    const faceCanvas = document.createElement("canvas");
-    faceCanvas.width = adjustedWidth;
-    faceCanvas.height = adjustedHeight;
-    const faceCtx = faceCanvas.getContext("2d");
+    // Рисуем исходное изображение со смещением
+    // (Сдвигаем так, чтобы центр лица совпал с центром канваса)
+    ctx.drawImage(sourceImage, -centerX, -centerY);
 
-    // Вырезаем корректную область
-    faceCtx.drawImage(
+    // Теперь вырезаем итоговый вертикальный прямоугольник из центра
+    const finalCanvas = document.createElement("canvas");
+    finalCanvas.width = box.width;  // Возвращаем к оригинальным размерам лица
+    finalCanvas.height = box.height;
+    const finalCtx = finalCanvas.getContext("2d");
+
+    finalCtx.drawImage(
         offscreenCanvas,
-        Math.max(0, rotatedMinX),
-        Math.max(0, rotatedMinY),
-        adjustedWidth,
-        adjustedHeight,
-        0,
-        0,
-        adjustedWidth,
-        adjustedHeight
+        (diag - box.width) / 2,  
+        (diag - box.height) / 2, 
+        box.width, 
+        box.height,       
+        0, 0,                
+        box.width, 
+        box.height        
     );
 
-    return faceCanvas;
+    return finalCanvas;
 }
 
+function displayRotatedDetections(detections, parentElement, angle) {
+    // 1. Удаляем старые рамки
+    const oldHighlighters = parentElement.querySelectorAll('.highlighter');
+    oldHighlighters.forEach(el => el.remove());
 
-function adjustBoundingBox(originalWidth, originalHeight, angle) {
-    const scaleFactor = 0.2; // Коэффициент расширения (можно настроить)
-    const angleLimit = 45; // Максимальный угол для масштабирования (чтобы не раздувалось бесконечно)
-    
-    const adjustedWidth = originalWidth * (1 + scaleFactor * Math.min(Math.abs(angle), angleLimit) / angleLimit);
-    const adjustedHeight = originalHeight * (1 + scaleFactor * Math.min(Math.abs(angle), angleLimit) / angleLimit);
-    return [adjustedWidth,adjustedHeight];
+    // 2. Ищем элемент медиа (видео или картинку) внутри контейнера
+    const media = parentElement.querySelector('video') || parentElement.querySelector('img');
+    if (!media) return; // Если нет медиа, выходим
+
+    // 3. Вычисление масштаба (ratio)
+    let ratioX = 1;
+    let ratioY = 1;
+
+    if (media.tagName === 'VIDEO') {
+        // Для видео: ширина на экране / реальная ширина потока
+        // Проверка на 0, чтобы не делить на ноль, если видео еще не загрузилось
+        if (media.videoWidth > 0) {
+            ratioX = media.offsetWidth / media.videoWidth;
+            ratioY = media.offsetHeight / media.videoHeight;
+        }
+    } else {
+        // Для картинки: ширина на экране / натуральная ширина файла
+        if (media.naturalWidth > 0) {
+            ratioX = media.width / media.naturalWidth;
+            ratioY = media.height / media.naturalHeight;
+        }
+    }
+
+    // 4. Проходим по всем найденным лицам
+    detections.forEach(det => {
+        const box = det.detection.box;
+        
+        // Создаем div для рамки
+        const highlighter = document.createElement("div");
+        highlighter.className = "highlighter";
+                
+        // А. Приводим размеры бокса к размеру экрана
+        const width = box.width * ratioX;
+        const height = box.height * ratioY;
+        
+        // Б. Приводим координаты (левый верхний угол) к размеру экрана
+        const x = box.x * ratioX;
+        const y = box.y * ratioY;
+
+        // В. Расчет ЦЕНТРА (cx, cy)
+        // cy (по вертикали) всегда одинаковый
+        const cy = y + height / 2;
+        
+        let cx;
+        if (media.tagName === 'VIDEO') {
+            // ДЛЯ ВИДЕО (Зеркальный режим):
+            // Формула: Ширина_Контейнера - (Координата_X + Половина_Ширины)
+            // Мы "отступаем" от правого края, а не от левого
+            cx = media.offsetWidth - (x + width / 2);
+        } else {
+            // ДЛЯ ФОТО (Обычный режим):
+            cx = x + width / 2;
+        }
+
+        // --- СТИЛИ ---
+
+        highlighter.style.position = 'absolute';
+        highlighter.style.width = `${width}px`;
+        highlighter.style.height = `${height}px`;
+        
+        // Позиционируем точку в вычисленный центр
+        highlighter.style.left = `${cx}px`;
+        highlighter.style.top = `${cy}px`;
+        
+        // Сдвигаем div на -50% от его собственного размера, чтобы центр div совпал с точкой (cx, cy)
+        // И поворачиваем на угол
+        // Для видео угол часто нужно инвертировать (angle или -angle)
+        const rotation = (media.tagName === 'VIDEO') ? -angle : angle; 
+        highlighter.style.transform = `translate(-50%, -50%) rotate(${rotation}deg)`;
+        
+        // Оформление рамки
+        highlighter.style.border = '2px solid #00ff00';
+        highlighter.style.zIndex = '10'; // Чтобы было поверх видео
+
+        // Добавляем на страницу
+        parentElement.appendChild(highlighter);
+    });
 }
 
-function drawImageOnCanvas(image, locImageCanvas) {
-    const imageCanvasctx = locImageCanvas.getContext("2d");
+function drawImageOnCanvas(image, canvas) {
+    const ctx = canvas.getContext("2d");
     const imgWidth = image.width;
     const imgHeight = image.height;
-    const canvasWidth = locImageCanvas.width;
-    const canvasHeight = locImageCanvas.height;
+    const canvasWidth = canvas.width;
+    const canvasHeight = canvas.height;
 
     const scale = Math.min(canvasWidth / imgWidth, canvasHeight / imgHeight);
     const newWidth = imgWidth * scale;
     const newHeight = imgHeight * scale;
-
-    // Вычисляем координаты для центрирования
     const x = (canvasWidth - newWidth) / 2;
     const y = (canvasHeight - newHeight) / 2;
 
-    imageCanvasctx.clearRect(0, 0, canvasWidth, canvasHeight);
-    imageCanvasctx.drawImage(image, x, y, newWidth, newHeight); // Исправлено: добавлены x и y
+    ctx.clearRect(0, 0, canvasWidth, canvasHeight);
+    ctx.drawImage(image, x, y, newWidth, newHeight);
 }
 
-
-function displayImageDetections(detections, resultElement, angle) {
-    const ratio = resultElement.height / resultElement.naturalHeight;
-    // console.log(ratio);
-    for (let detection of detections) {
-        const highlighter = document.createElement("div");
-        highlighter.setAttribute("class", "highlighter");
-
-        // Коррекция ширины бокса в зависимости от угла наклона лица
-        const [adjustedWidth, adjustedHeight] = adjustBoundingBox(detection.boundingBox.width * ratio, detection.boundingBox.height * ratio, angle);
-
-        // Вычисляем центр прямоугольника
-        const centerX = (detection.boundingBox.originX * ratio + detection.boundingBox.width * ratio / 2)
-        const centerY = (detection.boundingBox.originY * ratio + detection.boundingBox.height * ratio / 2)
-
-        highlighter.style.left = `${centerX}px`;
-        highlighter.style.top = `${centerY}px`;
-        highlighter.style.width = `${adjustedWidth}px`;
-        highlighter.style.height = `${adjustedHeight}px`;
-
-        // Добавляем поворот вокруг центра
-        highlighter.style.transform = `translate(-50%, -50%) rotate(${angle}deg)`;
-        highlighter.style.transformOrigin = "center";
-
-        resultElement.parentNode.appendChild(highlighter);
-    }
+function showEmbedding(descriptor, element) {
+    if (!descriptor) return;
+    // Descriptor - это Float32Array(128)
+    const sliced = descriptor.slice(0, 5); // берем первые 5 чисел для показа
+    element.innerText = `Float Embedding: [${sliced.map(n => n.toFixed(3)).join(', ')}...]`;
 }
 
-/********************************************************************
- // Demo 2: Continuously grab image from webcam stream and detect it.
- ********************************************************************/
-let video = document.getElementById("webcam");
-const liveView = document.getElementById("liveView");
-let enableWebcamButton;
-// Check if webcam access is supported.
-const hasGetUserMedia = () => { var _a; return !!((_a = navigator.mediaDevices) === null || _a === void 0 ? void 0 : _a.getUserMedia); };
-// Keep a reference of all the child elements we create
-// so we can remove them easilly on each render.
-var children = [];
-// If webcam supported, add event listener to button for when user
-// wants to activate it.
-if (hasGetUserMedia()) {
-    enableWebcamButton = document.getElementById("webcamButton");
-    enableWebcamButton.addEventListener("click", enableCam);
-}
-else {
-    console.warn("getUserMedia() is not supported by your browser");
-}
-// Enable the live webcam view and start detection.
-async function enableCam(event) {
-    if (!faceDetector) {
-        alert("Face Detector is still loading. Please try again..");
-        return;
-    }
-    // Hide the button.
-    enableWebcamButton.classList.add("removed");
-    // getUsermedia parameters
-    const constraints = {
-        video: true
-    };
-    // Activate the webcam stream.
-    navigator.mediaDevices
-        .getUserMedia(constraints)
-        .then(function (stream) {
-        video.srcObject = stream;
-        video.addEventListener("loadeddata", predictWebcam);
-    })
-        .catch((err) => {
-        console.error(err);
-    });
-}
-let lastVideoTime = -1;
-async function predictWebcam() {
-    // if image mode is initialized, create a new classifier with video runningMode
-    if (runningMode === "IMAGE") {
-        runningMode = "VIDEO";
-        await faceDetector.setOptions({ runningMode: "VIDEO" });
-    }
-    let startTimeMs = performance.now();
-    // Detect faces using detectForVideo
-    if (video.currentTime !== lastVideoTime) {
-        lastVideoTime = video.currentTime;
-        const detections = faceDetector.detectForVideo(video, startTimeMs)
-            .detections;
-
-        if(detections.length){ // check detections is not empty            
-            const HeadRotationAngle = calculateHeadRotationAngle(detections);
-            displayVideoDetections(detections, HeadRotationAngle);
-            const canvasCrop = getVideoImage(video)
-            videoFaceCropped = cropFace(detections, canvasCrop, HeadRotationAngle)
-            drawImageOnCanvas(videoFaceCropped, videoCanvas)
-            videoImageEmbedderResult = await imageEmbedder.embed(videoFaceCropped);
-            // showEmbedding(videoImageEmbedderResult, embeddingVideoImage)
-        }
-    }
-    if(!imageEmbedderResult && imageFaceCropped != null){
-        imageEmbedderResult = await imageEmbedder.embed(imageFaceCropped);
-    }
-    if(videoFaceCropped != null && imageEmbedderResult != null){
-        videoImageEmbedderResult = await imageEmbedder.embed(videoFaceCropped);       
-        showSimilarity(similarity)
-    }
-    // Call this function again to keep predicting when the browser is ready
-    window.requestAnimationFrame(predictWebcam);
+function showHeadAngle(element, val){
+    element.innerText = `Head Roll: ${val}°`;
 }
 
-function displayVideoDetections(detections, angle) {
-    // Remove any highlighting from previous frame.
-    for (let child of children) {
-        liveView.removeChild(child);
-    }
-    children.splice(0);
-
-    // Iterate through predictions and draw them to the live view
-    for (let detection of detections) {
-        const highlighter = document.createElement("div");
-        highlighter.classList.add("highlighter");
-
-        // Коррекция ширины бокса в зависимости от угла наклона лица
-        const [adjustedWidth, adjustedHeight] = adjustBoundingBox(detection.boundingBox.width, detection.boundingBox.height, angle);
-
-        // Вычисляем центр прямоугольника
-        const centerX = video.offsetWidth - (detection.boundingBox.originX + detection.boundingBox.width / 2);
-        const centerY = detection.boundingBox.originY + detection.boundingBox.height / 2;
-
-        highlighter.style.left = `${centerX}px`;
-        highlighter.style.top = `${centerY}px`;
-        highlighter.style.width = `${adjustedWidth}px`;
-        highlighter.style.height = `${adjustedHeight}px`;
-
-        // Добавляем поворот вокруг центра
-        highlighter.style.transform = `translate(-50%, -50%) rotate(${angle}deg)`;
-        highlighter.style.transformOrigin = "center";
-
-        liveView.appendChild(highlighter);
-        children.push(highlighter);
-    }
-}
-
-function getVideoImage(video){
-    const canvas = document.createElement("canvas");
-    const ctx = canvas.getContext('2d');    
-
-    canvas.width = video.videoWidth;
-    canvas.height = video.videoHeight;
-
-    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-    return canvas
-}
-
-function showEmbedding(imageEmbedderResult, element){
-    const truncatedEmbedding = imageEmbedderResult.embeddings[0].floatEmbedding;
-    truncatedEmbedding.length = 4;
-    element.innerText = `Float Embedding: ${truncatedEmbedding}...`;
-}
-
-function showSimilarity(element){
-    const similarityImage = ImageEmbedder.cosineSimilarity(imageEmbedderResult.embeddings[0], videoImageEmbedderResult.embeddings[0]);
-    element.innerText = `Similarity: ${similarityImage}`;
-}
-
-// Функция для вычисления угла наклона головы
-function calculateHeadRotationAngle(detections) {
-    
-    const landmarks = detections[0].keypoints;
-    const leftEye = landmarks[0]; // Левая глаз
-    const rightEye = landmarks[1]; // Правый глаз
-
-    // Вычисляем разницу по оси Y и X между глазами
-    const deltaY = rightEye.y - leftEye.y;
-    const deltaX = rightEye.x - leftEye.x;
-
-    // Вычисляем угол наклона головы в радианах
-    const angle = Math.atan2(deltaY, deltaX);
-
-    return -angle * 180 / Math.PI;
+function showHeadRotation(element, val){
+    element.innerText = `Head Yaw: ${val}°`;
 }
