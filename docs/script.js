@@ -19,14 +19,6 @@ let knownFaces = []; // Наша локальная база данных: [{id,
 let faceMatcher = null; // Объект face-api для сравнения лиц
 let currentPrimaryDescriptor = null; // Дескриптор лица, которое сейчас в фокусе (для сохранения)
 
-
-
-// // Импорт
-// import * as faceapi from 'https://cdn.jsdelivr.net/npm/@vladmandic/face-api/dist/face-api.esm.js';
-
-// // --- ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ---
-// const MODEL_URL = 'https://cdn.jsdelivr.net/npm/@vladmandic/face-api/model/';
-
 // // Элементы DOM
 const demosSection = document.getElementById("demos");
 const imageCanvas = document.getElementsByClassName("image_canvas")[0];
@@ -42,6 +34,9 @@ let targetDescriptor = null; // Эмбеддинг целевого фото
 let videoDescriptor = null;  // Эмбеддинг лица с видео
 let isModelLoaded = false;
 // let isVideoPlaying = false;
+
+// Константы
+const THRESHOLD = 0.5; // Порог узнавания
 
 // Опции детектора (SSD Mobilenet V1 - баланс скорости и точности)
 // minConfidence: 0.5 отсекает "шум"
@@ -119,8 +114,8 @@ function updateFaceMatcher() {
         return new faceapi.LabeledFaceDescriptors(face.name, [face.descriptor]);
     });
 
-    // 0.6 - порог схожести (чем меньше, тем строже)
-    faceMatcher = new faceapi.FaceMatcher(labeledDescriptors, 0.6);
+    // THRESHOLD - порог схожести (чем меньше, тем строже)
+    faceMatcher = new faceapi.FaceMatcher(labeledDescriptors, THRESHOLD);
 }
 
 // Обновление интерфейса (счетчик и дефолтное имя)
@@ -170,8 +165,6 @@ saveBtn.addEventListener('click', () => {
             bestMatchIndex = index;
         }
     });
-
-    const THRESHOLD = 0.6; // Порог узнавания
 
     if (bestMatchIndex !== -1 && minDistance < THRESHOLD) {
         // --- ЧЕЛОВЕК УЖЕ ЕСТЬ: ОБНОВЛЯЕМ ---
@@ -258,46 +251,78 @@ async function handleClick(event) {
 async function predictWebcam() {
     if (!isVideoPlaying) return;
 
-    // 1. Детекция
+    // 1. Детекция + landmarks
     const detections = await faceapi
         .detectAllFaces(video, getDetectorOptions())
-        .withFaceLandmarks()
-        .withFaceDescriptors();
+        .withFaceLandmarks();
 
     if (detections.length > 0) {
-        // Ресайзим результаты под размер видео на экране, чтобы рамка не улетала
-        const displaySize = { width: video.offsetWidth, height: video.offsetHeight };
+
+        const displaySize = { 
+            width: video.offsetWidth, 
+            height: video.offsetHeight 
+        };
+
         const resizedDetections = faceapi.resizeResults(detections, displaySize);
 
-        // 1. Получаем имена (results)
-        const results = resizedDetections.map(d => {
-            return faceMatcher ? faceMatcher.findBestMatch(d.descriptor) : { label: "Unknown", distance: 1 };
-        });
-        
-        const face = resizedDetections[0];
-        
-        // Обратите внимание: дескриптор берем из первой детекции
-        videoDescriptor = detections[0].descriptor; 
+        const results = [];
+        const alignedDescriptors = [];
 
-        currentPrimaryDescriptor = videoDescriptor;
+        for (let i = 0; i < detections.length; i++) {
 
-        // 2. Углы
-        const angles = calculateHeadRotationAngle(face.landmarks);
-        showHeadRotation(headRotationElement, angles.yaw.toFixed(1));     
-        showHeadAngle(headAngleElement, angles.roll.toFixed(1)); 
+            const originalDetection = detections[i];        // оригинальные координаты (для кропа)
+            const resizedFace = resizedDetections[i];       // для отображения
 
-        // 3. Рисуем ПОВЕРНУТУЮ рамку на видео
-        displayRotatedDetections(resizedDetections, results, liveView, angles.roll);
+            // 2. Углы
+            const angles = calculateHeadRotationAngle(resizedFace.landmarks);
 
-        // 4. Кропаем лицо с видео (Выпрямляем его)
-        const croppedCanvas = cropRotatedFace(video, detections[0], -angles.roll);
-        
-        drawImageOnCanvas(croppedCanvas, videoCanvas);
+            // Показываем углы только для первого лица
+            if (i === 0) {
+                showHeadRotation(headRotationElement, angles.yaw.toFixed(1));
+                showHeadAngle(headAngleElement, angles.roll.toFixed(1));
+            }
 
-        if (targetDescriptor) calculateAndShowSimilarity();
+            // 3. Кроп + выравнивание
+            const croppedCanvas = cropRotatedFace(
+                video,
+                originalDetection,
+                -angles.roll
+            );
+
+            // Можно показывать только первое лицо
+            if (i === 0) {
+                drawImageOnCanvas(croppedCanvas, videoCanvas);
+            }
+
+            // 4. Descriptor для конкретного лица
+            const descriptor = await faceapi.computeFaceDescriptor(croppedCanvas);
+
+            alignedDescriptors.push(descriptor);
+
+            // 5. Сопоставление
+            if (faceMatcher) {
+                const bestMatch = faceMatcher.findBestMatch(descriptor);
+                results.push(bestMatch);
+            } else {
+                results.push({ label: "Unknown", distance: 1 });
+            }
+        }
+
+        // Если нужно хранить основной descriptor
+        currentPrimaryDescriptor = alignedDescriptors[0] || null;
+        videoDescriptor = alignedDescriptors[0] || null;
+
+        // 6. Рисуем рамки
+        displayRotatedDetections(resizedDetections, results, liveView, null);
+
+        if (targetDescriptor && currentPrimaryDescriptor) {
+            calculateAndShowSimilarity();
+        }
+
     } else {
+
         currentPrimaryDescriptor = null;
-        // Если лиц нет, убираем рамки
+
         const old = liveView.querySelectorAll('.highlighter');
         old.forEach(el => el.remove());
     }
@@ -341,7 +366,7 @@ function calculateAndShowSimilarity() {
     
     // Перевод в % схожести (примерная формула)
     // 0 distance = 100% similarity
-    // > 0.6 distance = 0% similarity (другой человек)
+    // > THRESHOLD distance = 0% similarity (другой человек)
     const similarityVal = Math.max(0, 1 - distance);
     
     similarityElement.innerText = `Similarity: ${similarityVal.toFixed(2)}`;
