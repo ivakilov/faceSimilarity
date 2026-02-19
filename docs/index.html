@@ -2,7 +2,6 @@
 <html lang="en" >
 <head>
   <meta charset="UTF-8">
-  <title>MediaPipe Face Detector for web</title>
   <link rel="stylesheet" href="./style.css">
 
 </head>
@@ -13,6 +12,25 @@
 <!-- <h1>Face detection using the MediaPipe Face Detector task</h1> -->
 
 <section id="demos" class="invisible">
+  <div class="controls-container" style="margin-top: 10px; padding: 10px; border: 1px solid #ccc;">
+    <h3>Управление базой лиц</h3>
+    
+    <!-- Поле для имени -->
+    <label for="personName">Имя:</label>
+    <input type="text" id="personName" placeholder="Введите имя">
+    
+    <!-- Кнопка сохранения -->
+    <button id="saveFaceBtn">Сохранить лицо</button>
+    
+    <!-- Информация -->
+    <div id="saveStatus" style="margin-top: 5px; color: green;"></div>
+    
+    <!-- Список сохраненных (для отладки) -->
+    <div style="margin-top: 10px;">
+        <small>Всего в базе: <span id="dbCount">0</span> лиц</small>
+        <button onclick="clearDatabase()">Очистить базу</button>
+    </div>
+</div>
 
   <div class="detectOnClick">
     <img id="inputImage" src="face.png" width="100%" />
@@ -21,8 +39,6 @@
   </div>
   </div>
 
-  <h2>Demo: Webcam continuous face detection</h2>
-  <p>Detect faces from your webcam. When ready click "enable webcam" below and accept access to the webcam.</p>
   <div id="liveView" class="videoView">
     <button id="webcamButton" class="mdc-button mdc-button--raised">
       <span class="mdc-button__ripple"></span>

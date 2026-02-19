@@ -1,33 +1,55 @@
-// Импорт
 import * as faceapi from 'https://cdn.jsdelivr.net/npm/@vladmandic/face-api/dist/face-api.esm.js';
 
 // --- ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ---
 const MODEL_URL = 'https://cdn.jsdelivr.net/npm/@vladmandic/face-api/model/';
 
 // Элементы DOM
+const video = document.getElementById("webcam");
+const liveView = document.getElementById("liveView");
+const videoCanvas = document.getElementsByClassName("video_canvas")[0];
+// Элементы для управления базой
+const nameInput = document.getElementById("personName");
+const saveBtn = document.getElementById("saveFaceBtn");
+const statusMsg = document.getElementById("saveStatus");
+const dbCountSpan = document.getElementById("dbCount");
+
+// Переменные состояния
+let isVideoPlaying = false;
+let knownFaces = []; // Наша локальная база данных: [{id, name, descriptor, date}]
+let faceMatcher = null; // Объект face-api для сравнения лиц
+let currentPrimaryDescriptor = null; // Дескриптор лица, которое сейчас в фокусе (для сохранения)
+
+
+
+// // Импорт
+// import * as faceapi from 'https://cdn.jsdelivr.net/npm/@vladmandic/face-api/dist/face-api.esm.js';
+
+// // --- ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ---
+// const MODEL_URL = 'https://cdn.jsdelivr.net/npm/@vladmandic/face-api/model/';
+
+// // Элементы DOM
 const demosSection = document.getElementById("demos");
 const imageCanvas = document.getElementsByClassName("image_canvas")[0];
-const videoCanvas = document.getElementsByClassName("video_canvas")[0];
+// const videoCanvas = document.getElementsByClassName("video_canvas")[0];
 const embeddingImage = document.getElementById("embedImage");
 const similarityElement = document.getElementById("similarity");
 const headAngleElement = document.getElementById("headAngle");
 const headRotationElement = document.getElementById("headRotation");
-const video = document.getElementById("webcam");
-const liveView = document.getElementById("liveView");
 let enableWebcamButton = document.getElementById("webcamButton");
 
-// Переменные для хранения данных
+// // Переменные для хранения данных
 let targetDescriptor = null; // Эмбеддинг целевого фото
 let videoDescriptor = null;  // Эмбеддинг лица с видео
 let isModelLoaded = false;
-let isVideoPlaying = false;
+// let isVideoPlaying = false;
 
 // Опции детектора (SSD Mobilenet V1 - баланс скорости и точности)
 // minConfidence: 0.5 отсекает "шум"
 const getDetectorOptions = () => new faceapi.SsdMobilenetv1Options({ minConfidence: 0.5 });
 
 
-// --- ИНИЦИАЛИЗАЦИЯ ---
+// --- 1. ЗАГРУЗКА И ИНИЦИАЛИЗАЦИЯ ---
+
 const initializeFaceModels = async () => {
     console.log("⏳ Загрузка моделей нейросети...");
     try {
@@ -49,6 +71,141 @@ const initializeFaceModels = async () => {
 };
 
 initializeFaceModels();
+
+// --- 2. МЕНЕДЖЕР БАЗЫ ДАННЫХ (LOCAL STORAGE) ---
+
+// Загрузка данных
+function loadFacesFromStorage() {
+    const data = localStorage.getItem('face_db_resource');
+    if (data) {
+        const parsedData = JSON.parse(data);
+        // Важно: JSON превращает Float32Array в обычный массив. 
+        // Face-api требует Float32Array, конвертируем обратно.
+        knownFaces = parsedData.map(item => ({
+            ...item,
+            descriptor: new Float32Array(Object.values(item.vector)) 
+        }));
+    } else {
+        knownFaces = [];
+    }
+    updateFaceMatcher();
+    updateUI();
+}
+
+// Сохранение данных
+function saveFacesToStorage() {
+    // Преобразуем descriptor (Float32Array) в обычный массив для JSON
+    const dataToSave = knownFaces.map(item => ({
+        id: item.id,
+        name: item.name,
+        vector: Array.from(item.descriptor), // Конвертация для JSON
+        date: item.date
+    }));
+    
+    localStorage.setItem('face_db_resource', JSON.stringify(dataToSave));
+    updateFaceMatcher();
+    updateUI();
+}
+
+// Обновление FaceMatcher (создание индекса для быстрого поиска)
+function updateFaceMatcher() {
+    if (knownFaces.length === 0) {
+        faceMatcher = null;
+        return;
+    }
+
+    // Создаем LabeledFaceDescriptors для face-api
+    const labeledDescriptors = knownFaces.map(face => {
+        return new faceapi.LabeledFaceDescriptors(face.name, [face.descriptor]);
+    });
+
+    // 0.6 - порог схожести (чем меньше, тем строже)
+    faceMatcher = new faceapi.FaceMatcher(labeledDescriptors, 0.6);
+}
+
+// Обновление интерфейса (счетчик и дефолтное имя)
+function updateUI() {
+    if(dbCountSpan) dbCountSpan.innerText = knownFaces.length;
+}
+
+// Генерация следующего имени по умолчанию
+function getNextDefaultName() {
+    // Находим максимальный ID
+    const maxId = knownFaces.reduce((max, p) => (p.id > max ? p.id : max), 0);
+    const nextId = maxId + 1;
+    return { name: `name${nextId}`, id: nextId };
+}
+
+// Очистка базы (для тестов, добавить в window чтобы вызывать из HTML)
+window.clearDatabase = () => {
+    localStorage.removeItem('face_db_resource');
+    loadFacesFromStorage();
+    alert("База очищена");
+};
+
+
+// --- 3. ОБРАБОТЧИК КНОПКИ "СОХРАНИТЬ" ---
+
+saveBtn.addEventListener('click', () => {
+    if (!currentPrimaryDescriptor) {
+        statusMsg.innerText = "Нет лица для сохранения!";
+        return;
+    }
+
+    const inputName = nameInput.value.trim();
+    if (!inputName) {
+        statusMsg.innerText = "Введите имя!";
+        return;
+    }
+
+    // Проверяем, есть ли уже такой человек (по вектору)
+    let bestMatchIndex = -1;
+    let minDistance = 1.0;
+
+    // Поиск самого похожего вектора в нашей базе
+    knownFaces.forEach((face, index) => {
+        const dist = faceapi.euclideanDistance(face.descriptor, currentPrimaryDescriptor);
+        if (dist < minDistance) {
+            minDistance = dist;
+            bestMatchIndex = index;
+        }
+    });
+
+    const THRESHOLD = 0.6; // Порог узнавания
+
+    if (bestMatchIndex !== -1 && minDistance < THRESHOLD) {
+        // --- ЧЕЛОВЕК УЖЕ ЕСТЬ: ОБНОВЛЯЕМ ---
+        // Если имя в поле отличается от сохраненного, обновляем имя тоже, иначе оставляем старое
+        knownFaces[bestMatchIndex].descriptor = currentPrimaryDescriptor;
+        knownFaces[bestMatchIndex].date = new Date().toISOString();
+        // Можно решить: перезаписывать имя всегда или только если совпадает
+        knownFaces[bestMatchIndex].name = inputName; 
+        
+        statusMsg.innerText = `Обновлен: ${inputName} (Схожесть: ${(1-minDistance).toFixed(2)})`;
+    } else {
+        // --- НОВЫЙ ЧЕЛОВЕК ---
+        const newIdData = getNextDefaultName();
+        // Используем ID из генератора, если это совсем новый, но имя берем из инпута
+        // (Инпут мог быть автозаполнен `nameX`, а пользователь мог его не менять)
+        
+        // Нам нужно определить ID. Если мы ввели уникальное имя вручную, ID все равно должен быть уникальным числом.
+        const maxId = knownFaces.reduce((max, p) => (p.id > max ? p.id : max), 0);
+        
+        const newPerson = {
+            id: maxId + 1,
+            name: inputName,
+            descriptor: currentPrimaryDescriptor,
+            date: new Date().toISOString()
+        };
+        knownFaces.push(newPerson);
+        statusMsg.innerText = `Сохранен новый: ${inputName}`;
+    }
+
+    saveFacesToStorage();
+    
+    // Очистка сообщения через 2 сек
+    setTimeout(() => { statusMsg.innerText = ""; }, 2000);
+});
 
 
 // --- ОБРАБОТКА КЛИКА ПО КАРТИНКЕ (TARGET IMAGE) ---
@@ -82,8 +239,7 @@ async function handleClick(event) {
     showHeadAngle(headAngleElement, angles.roll.toFixed(1)); 
 
     // 3. Рисуем ПОВЕРНУТУЮ рамку
-    // Передаем угол Roll
-    displayRotatedDetections([face], parent, angles.roll);
+    displayRotatedDetections(detections, undefined, parent, angles.roll);
 
     // 4. Делаем "Умный кроп" (вырезаем выпрямленное лицо)
     // Передаем исходную картинку, данные детекции и угол, на который надо "откатить" наклон
@@ -112,13 +268,18 @@ async function predictWebcam() {
         // Ресайзим результаты под размер видео на экране, чтобы рамка не улетала
         const displaySize = { width: video.offsetWidth, height: video.offsetHeight };
         const resizedDetections = faceapi.resizeResults(detections, displaySize);
+
+        // 1. Получаем имена (results)
+        const results = resizedDetections.map(d => {
+            return faceMatcher ? faceMatcher.findBestMatch(d.descriptor) : { label: "Unknown", distance: 1 };
+        });
         
         const face = resizedDetections[0];
         
-        // Обратите внимание: дескриптор берем из ОРИГИНАЛЬНОЙ (не ресайзнутой) детекции для точности,
-        // но для простоты здесь возьмем из первой (face-api обычно справляется).
-        // Лучше брать дескриптор от `detections[0]`, а координаты для рамки от `resizedDetections[0]`.
+        // Обратите внимание: дескриптор берем из первой детекции
         videoDescriptor = detections[0].descriptor; 
+
+        currentPrimaryDescriptor = videoDescriptor;
 
         // 2. Углы
         const angles = calculateHeadRotationAngle(face.landmarks);
@@ -126,18 +287,16 @@ async function predictWebcam() {
         showHeadAngle(headAngleElement, angles.roll.toFixed(1)); 
 
         // 3. Рисуем ПОВЕРНУТУЮ рамку на видео
-        displayRotatedDetections([face], liveView, angles.roll);
+        displayRotatedDetections(resizedDetections, results, liveView, angles.roll);
 
         // 4. Кропаем лицо с видео (Выпрямляем его)
-        // Важно: кропаем с самого видео-элемента
-        // Используем 'detections[0]' (реальные координаты видео), а не 'face' (экранные координаты),
-        // так как cropRotatedFace работает с sourceImage (video) напрямую.
         const croppedCanvas = cropRotatedFace(video, detections[0], -angles.roll);
         
         drawImageOnCanvas(croppedCanvas, videoCanvas);
 
         if (targetDescriptor) calculateAndShowSimilarity();
     } else {
+        currentPrimaryDescriptor = null;
         // Если лиц нет, убираем рамки
         const old = liveView.querySelectorAll('.highlighter');
         old.forEach(el => el.remove());
@@ -274,28 +433,23 @@ function cropRotatedFace(sourceImage, result, angle) {
     return finalCanvas;
 }
 
-function displayRotatedDetections(detections, parentElement, angle) {
+function displayRotatedDetections(detections, results, parentElement, angle) {
     // 1. Удаляем старые рамки
     const oldHighlighters = parentElement.querySelectorAll('.highlighter');
     oldHighlighters.forEach(el => el.remove());
 
-    // 2. Ищем элемент медиа (видео или картинку) внутри контейнера
     const media = parentElement.querySelector('video') || parentElement.querySelector('img');
-    if (!media) return; // Если нет медиа, выходим
+    if (!media) return;
 
-    // 3. Вычисление масштаба (ratio)
     let ratioX = 1;
     let ratioY = 1;
 
     if (media.tagName === 'VIDEO') {
-        // Для видео: ширина на экране / реальная ширина потока
-        // Проверка на 0, чтобы не делить на ноль, если видео еще не загрузилось
         if (media.videoWidth > 0) {
             ratioX = media.offsetWidth / media.videoWidth;
             ratioY = media.offsetHeight / media.videoHeight;
         }
     } else {
-        // Для картинки: ширина на экране / натуральная ширина файла
         if (media.naturalWidth > 0) {
             ratioX = media.width / media.naturalWidth;
             ratioY = media.height / media.naturalHeight;
@@ -303,57 +457,68 @@ function displayRotatedDetections(detections, parentElement, angle) {
     }
 
     // 4. Проходим по всем найденным лицам
-    detections.forEach(det => {
+    detections.forEach((det, i) => {
         const box = det.detection.box;
         
-        // Создаем div для рамки
+        // Получаем имя и дистанцию для текущего лица
+        // Если results передали, берем i-й элемент, иначе ставим заглушку
+        const match = results ? results[i] : { label: 'detecting...', distance: 0 };
+        const labelText = match.label;
+        const isUnknown = labelText === 'unknown';
+
+        // Выбираем цвет: Красный если неизвестен, Зеленый если известен
+        const boxColor = isUnknown ? 'red' : '#00ff00';
+
         const highlighter = document.createElement("div");
         highlighter.className = "highlighter";
                 
-        // А. Приводим размеры бокса к размеру экрана
         const width = box.width * ratioX;
         const height = box.height * ratioY;
-        
-        // Б. Приводим координаты (левый верхний угол) к размеру экрана
         const x = box.x * ratioX;
         const y = box.y * ratioY;
-
-        // В. Расчет ЦЕНТРА (cx, cy)
-        // cy (по вертикали) всегда одинаковый
         const cy = y + height / 2;
         
         let cx;
         if (media.tagName === 'VIDEO') {
-            // ДЛЯ ВИДЕО (Зеркальный режим):
-            // Формула: Ширина_Контейнера - (Координата_X + Половина_Ширины)
-            // Мы "отступаем" от правого края, а не от левого
             cx = media.offsetWidth - (x + width / 2);
         } else {
-            // ДЛЯ ФОТО (Обычный режим):
             cx = x + width / 2;
         }
 
-        // --- СТИЛИ ---
-
+        // Стили рамки
         highlighter.style.position = 'absolute';
         highlighter.style.width = `${width}px`;
         highlighter.style.height = `${height}px`;
-        
-        // Позиционируем точку в вычисленный центр
         highlighter.style.left = `${cx}px`;
         highlighter.style.top = `${cy}px`;
+
+        const angles = calculateHeadRotationAngle(det.landmarks);
         
-        // Сдвигаем div на -50% от его собственного размера, чтобы центр div совпал с точкой (cx, cy)
-        // И поворачиваем на угол
-        // Для видео угол часто нужно инвертировать (angle или -angle)
-        const rotation = (media.tagName === 'VIDEO') ? -angle : angle; 
+        const rotation = (media.tagName === 'VIDEO') ? -angles.roll : angles.roll; 
         highlighter.style.transform = `translate(-50%, -50%) rotate(${rotation}deg)`;
         
-        // Оформление рамки
-        highlighter.style.border = '2px solid #00ff00';
-        highlighter.style.zIndex = '10'; // Чтобы было поверх видео
+        // Используем динамический цвет
+        highlighter.style.border = `2px solid ${boxColor}`;
+        highlighter.style.zIndex = '10';
 
-        // Добавляем на страницу
+        // Создаем плашку с именем и дистанцией
+        const nameTag = document.createElement("div");
+        nameTag.innerText = `${labelText} (${(match.distance ? (1 - match.distance).toFixed(2) : '')})`;
+        
+        // Стили текста
+        nameTag.style.position = 'absolute';
+        nameTag.style.bottom = '100%'; // Прилепить сверху рамки
+        nameTag.style.left = '-2px';   // Выровнять по левому краю (с учетом бордера)
+        nameTag.style.backgroundColor = boxColor;
+        nameTag.style.color = 'white';
+        nameTag.style.padding = '2px 5px';
+        nameTag.style.fontSize = '14px';
+        nameTag.style.fontWeight = 'bold';
+        nameTag.style.whiteSpace = 'nowrap'; // Чтобы текст не переносился
+        
+        // Добавляем текст ВНУТРЬ рамки (чтобы он вращался вместе с ней)
+        highlighter.appendChild(nameTag);
+
         parentElement.appendChild(highlighter);
     });
 }
